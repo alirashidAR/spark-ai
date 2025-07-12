@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.prompts import MessagesPlaceholder  # Added this import
+from typing import Optional, List, Dict, Any
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.prompts import MessagesPlaceholder
 import uvicorn
-import uuid  # Added this import
+import uuid
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -40,9 +40,13 @@ app.add_middleware(
 )
 
 # Pydantic models
+class ContextData(BaseModel):
+    context: Dict[str, Any]
+    session_id: Optional[str] = None
+
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None  # For continuing existing conversations
+    session_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
     response: str
@@ -76,14 +80,37 @@ def get_message_history(session_id: str) -> MongoDBChatMessageHistory:
         collection_name=COLLECTION_NAME,
     )
 
+@app.post("/set_context")
+async def set_context(context_data: ContextData):
+    try:
+        session_id = context_data.session_id or str(uuid.uuid4())
+        message_history = get_message_history(session_id)
+        
+        # Clear any existing context
+        message_history.clear()
+        
+        # Add system message with context
+        context_str = "\n".join(f"{k}: {v}" for k, v in context_data.context.items())
+        system_message = SystemMessage(
+            content=f"Additional context provided:\n{context_str}\n\n"
+                    "Use this information to better answer user questions."
+        )
+        message_history.add_message(system_message)
+        
+        return {"session_id": session_id, "status": "context_set"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     try:
-        # Generate a session ID if not provided
-        session_id = request.session_id or str(uuid.uuid4())
-        
-        # Get message history from MongoDB
-        message_history = get_message_history(session_id)
+        if not request.session_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Session ID required. Set context first using /set_context"
+            )
+            
+        message_history = get_message_history(request.session_id)
         
         # Get agent response
         response = agent.invoke({
@@ -95,7 +122,7 @@ async def chat_endpoint(request: ChatRequest):
         message_history.add_user_message(request.message)
         message_history.add_ai_message(response['output'])
         
-        # Format history for response
+        # Format history for response (excluding system messages)
         formatted_history = []
         for msg in message_history.messages:
             if isinstance(msg, HumanMessage):
@@ -105,7 +132,7 @@ async def chat_endpoint(request: ChatRequest):
         
         return ChatResponse(
             response=response['output'],
-            session_id=session_id,
+            session_id=request.session_id,
             history=formatted_history
         )
     except Exception as e:
@@ -117,7 +144,9 @@ async def get_history(session_id: str):
         message_history = get_message_history(session_id)
         formatted_history = []
         for msg in message_history.messages:
-            if isinstance(msg, HumanMessage):
+            if isinstance(msg, SystemMessage):
+                formatted_history.append({"role": "system", "content": msg.content})
+            elif isinstance(msg, HumanMessage):
                 formatted_history.append({"role": "user", "content": msg.content})
             elif isinstance(msg, AIMessage):
                 formatted_history.append({"role": "assistant", "content": msg.content})
@@ -128,7 +157,6 @@ async def get_history(session_id: str):
 @app.get("/health")
 async def health_check():
     try:
-        # Simple check to verify MongoDB connection
         test_history = get_message_history("health_check")
         test_history.add_user_message("ping")
         test_history.clear()
