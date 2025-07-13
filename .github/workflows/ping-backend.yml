@@ -1,0 +1,13 @@
+name: Keep Render Server Warm 
+
+on:
+  schedule:
+    - cron: '*/3 * * * *' # every 5 minutes
+  workflow_dispatch: # allows manual triggering
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Curl Ping to Keep Server Warm
+        run: curl -s https://spark-ai-1rd9.onrender.com/health
